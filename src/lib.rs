@@ -4,9 +4,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Host, StreamConfig};
 
 use std::error::Error;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -64,81 +63,27 @@ impl Client {
         })
     }
 
-    // Get the voice data from the other person
-    async fn spawn_io_thread(
-        mut stream: TcpStream,
-        msg_channel: (Sender<Vec<f32>>, Receiver<Vec<f32>>),
-        output_device: Device,
-        config: StreamConfig,
-    ) -> Sender<Vec<f32>> {
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let (input_sender, input_receiver) = channel::<Vec<f32>>();
-
-        thread::spawn(move || {
-            loop {
-                // Receive audio data
-                if let Ok(mut voice_data) = msg_channel.1.try_recv() {
-                    let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        for sample in data {
-                            *sample = voice_data.pop().unwrap_or(0.0);
-                        }
-                    };
-
-                    // Play audio
-                    let output_stream = output_device
-                        .build_output_stream(&config, output_data_fn, err_fn, None)
-                        .unwrap();
-                    output_stream.play().unwrap();
-                    thread::sleep(SLEEP_DURATION);
-                }
-
-                let mut buffer: Vec<u8> = Vec::new();
-                if let Ok(n) = reader.read(&mut buffer) {
-                    println!("received buffer len: {n}");
-                }
-
-                match input_receiver.try_recv() {
-                    Ok(data) => {
-                        let mut fixed_data_buffer: Vec<u8> = Vec::with_capacity(data.len() * 4);
-                        for f in &data {
-                            fixed_data_buffer.extend_from_slice(&f.to_le_bytes());
-                        }
-                        println!("fixed data: {}", fixed_data_buffer.len());
-                        msg_channel.0.send(data).unwrap();
-                        // SEND DATA
-                        match stream.write_all(&fixed_data_buffer) {
-                            Ok(_) => (),
-                            Err(_err) => return,
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        panic!("Channel disconnected!")
-                    }
-                }
-                thread::sleep(SLEEP_DURATION);
-            }
-        });
-        input_sender
-    }
-
-    async fn chat(&mut self, stream: TcpStream) -> Result<(), Box<dyn Error>> {
+    async fn chat(&mut self, mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
         println!("Entering chat...\n");
         stream.set_nonblocking(true).unwrap();
-        let send_channel = channel::<Vec<f32>>();
-        let recv_chennel = channel::<Vec<f32>>();
-
-        let input_sender = Self::spawn_io_thread(
-            stream,
-            (send_channel.0, recv_chennel.1),
-            self.output_device.clone(),
-            self.config.clone(),
-        )
-        .await;
 
         loop {
+            let mut buffer: Vec<u8> = vec![
+                0;
+                SLEEP_DURATION.as_secs() as usize
+                    * 4
+                    * (self.config.sample_rate.0 * self.config.channels as u32)
+                        as usize
+            ];
+            if let Ok(_) = stream.read_exact(&mut buffer) {
+                println!(
+                    "Received bytes! ({} non-zero)",
+                    buffer.iter().filter(|e| **e != 0).count()
+                );
+            }
+            let audio_data = buffer_to_audio_data(&buffer);
+
             // Play audio
-            let audio_data = send_channel.1.try_recv().unwrap_or(Vec::new());
             let mut i: usize = 0;
             let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 for sample in data {
@@ -148,7 +93,12 @@ impl Client {
             };
             let output_stream = self
                 .output_device
-                .build_output_stream(&self.config, output_data_fn, err_fn, None)
+                .build_output_stream(
+                    &self.config,
+                    output_data_fn,
+                    |e| eprintln!("Stream error: {e}"),
+                    None,
+                )
                 .unwrap();
             output_stream.play().unwrap();
 
@@ -157,27 +107,34 @@ impl Client {
             )));
             let input_samples_ref = input_samples.clone();
 
+            const VOLUME: f32 = 10.0;
+            // TODO: normalize data
             let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mut lock = input_samples_ref.try_lock().unwrap();
-                let buffer: &mut Vec<f32> = lock.as_mut();
-                buffer.extend_from_slice(data);
+                if let Ok(mut lock) = input_samples_ref.try_lock() {
+                    let buffer: &mut Vec<f32> = lock.as_mut();
+                    buffer
+                        .extend_from_slice(&data.iter().map(|f| f * VOLUME).collect::<Vec<f32>>());
+                }
             };
 
             // Record samples
-            let input_stream =
-                self.input_device
-                    .build_input_stream(&self.config, input_data_fn, err_fn, None)?;
+            let input_stream = self.input_device.build_input_stream(
+                &self.config,
+                input_data_fn,
+                |e| eprintln!("Stream error: {e}"),
+                None,
+            )?;
             input_stream.play()?;
             thread::sleep(SLEEP_DURATION);
 
             // Send Samples
             if let Ok(inner) = input_samples.lock() {
-                println!("Input samples sent: {}", inner.len());
-                if !inner.is_empty() {
-                    match input_sender.send(inner.to_vec()) {
-                        Ok(_) => (),
-                        Err(err) => panic!("Failed to send sample: {err}"),
-                    }
+                let mut fixed_data_buffer: Vec<u8> = Vec::with_capacity(inner.len() * 4);
+                for f in &inner.to_vec() {
+                    fixed_data_buffer.extend_from_slice(&f.to_le_bytes());
+                }
+                if let Ok(_) = stream.write_all(&fixed_data_buffer) {
+                    println!("Sent bytes!");
                 }
             }
         }
@@ -198,6 +155,15 @@ impl Client {
 }
 
 // Helper functions
+
+fn buffer_to_audio_data(buffer: &[u8]) -> Vec<f32> {
+    let mut audio_data: Vec<f32> = Vec::with_capacity(buffer.len() / 4);
+    for i in (0..buffer.len()).step_by(4) {
+        let flt = f32::from_le_bytes([buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]]);
+        audio_data.push(flt);
+    }
+    audio_data
+}
 
 #[allow(unused_variables)]
 fn get_audio_host(opt: &Opt) -> Host {
@@ -290,8 +256,4 @@ fn get_device_config(device: &Device) -> StreamConfig {
     };
     let config: StreamConfig = supported_config.into();
     config
-}
-
-fn err_fn(err: cpal::StreamError) {
-    eprintln!("An error occurred on stream: {err}");
 }

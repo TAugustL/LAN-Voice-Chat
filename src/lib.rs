@@ -1,15 +1,21 @@
 #![forbid(unsafe_code)]
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Host, StreamConfig};
+use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::{Device, StreamConfig};
 
 use std::error::Error;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-struct Opt {
+mod util;
+use util::{
+    buffer_to_audio_data, get_audio_host, get_device_config, get_input_device, get_output_device,
+    normalize,
+};
+
+pub struct Opt {
     /// The audio devices to use
     input_device: String,
     output_device: String,
@@ -38,7 +44,7 @@ impl Opt {
     }
 }
 
-const SLEEP_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
+const SLEEP_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct Client {
     pub address: String,
@@ -67,15 +73,13 @@ impl Client {
         println!("Entering chat...\n");
         stream.set_nonblocking(true).unwrap();
 
+        let buffer_size = SLEEP_DURATION.as_secs() as usize
+            * 4
+            * (self.config.sample_rate.0 * self.config.channels as u32) as usize;
+
         loop {
-            let mut buffer: Vec<u8> = vec![
-                0;
-                SLEEP_DURATION.as_secs() as usize
-                    * 4
-                    * (self.config.sample_rate.0 * self.config.channels as u32)
-                        as usize
-            ];
-            if let Ok(_) = stream.read_exact(&mut buffer) {
+            let mut buffer: Vec<u8> = vec![0; buffer_size];
+            if stream.read_exact(&mut buffer).is_ok() {
                 println!(
                     "Received bytes! ({} non-zero)",
                     buffer.iter().filter(|e| **e != 0).count()
@@ -107,13 +111,13 @@ impl Client {
             )));
             let input_samples_ref = input_samples.clone();
 
-            const VOLUME: f32 = 10.0;
-            // TODO: normalize data
+            const VOLUME: f32 = 7.5;
             let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if let Ok(mut lock) = input_samples_ref.try_lock() {
                     let buffer: &mut Vec<f32> = lock.as_mut();
-                    buffer
-                        .extend_from_slice(&data.iter().map(|f| f * VOLUME).collect::<Vec<f32>>());
+                    let norm_data = normalize(data);
+                    let final_data: Vec<f32> = norm_data.iter().map(|f| f * VOLUME).collect();
+                    buffer.extend_from_slice(&final_data);
                 }
             };
 
@@ -133,7 +137,7 @@ impl Client {
                 for f in &inner.to_vec() {
                     fixed_data_buffer.extend_from_slice(&f.to_le_bytes());
                 }
-                if let Ok(_) = stream.write_all(&fixed_data_buffer) {
+                if stream.write_all(&fixed_data_buffer).is_ok() {
                     println!("Sent bytes!");
                 }
             }
@@ -149,111 +153,12 @@ impl Client {
 
     pub async fn connect(&mut self) -> Result<(), Box<dyn Error>> {
         let stream = TcpStream::connect(&self.address)?;
+        if stream.peer_addr()?.ip() == stream.local_addr()?.ip() {
+            println!(
+                "\nWARNING: It seems like you are connecting to yourself. Unless you specefied different output devices for the the chat instances, you may hear a lot of noise and echoes.\n"
+            );
+        }
         self.chat(stream).await?;
         Ok(())
     }
-}
-
-// Helper functions
-
-fn buffer_to_audio_data(buffer: &[u8]) -> Vec<f32> {
-    let mut audio_data: Vec<f32> = Vec::with_capacity(buffer.len() / 4);
-    for i in (0..buffer.len()).step_by(4) {
-        let flt = f32::from_le_bytes([buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]]);
-        audio_data.push(flt);
-    }
-    audio_data
-}
-
-#[allow(unused_variables)]
-fn get_audio_host(opt: &Opt) -> Host {
-    // Conditionally compile with jack if the feature is specified.
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd"
-        ),
-        feature = "jack"
-    ))]
-    // Manually check for flags. Can be passed through cargo with -- e.g.
-    // cargo run --release --example beep --features jack -- --jack
-    let audio_host = if opt.jack {
-        println!("HINT: using jack");
-        cpal::host_from_id(cpal::available_hosts()
-            .into_iter()
-            .find(|id| *id == cpal::HostId::Jack)
-            .expect(
-                "Make sure --features jack is specified. Only works on OSes where jack is available!",
-            )).expect("jack host unavailable!")
-    } else {
-        cpal::default_host()
-    };
-    #[cfg(any(
-        not(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd"
-        )),
-        not(feature = "jack")
-    ))]
-    let audio_host = cpal::default_host();
-
-    audio_host
-}
-
-fn get_input_device(audio_host: &Host, opt: &Opt) -> Result<Device, Box<dyn Error>> {
-    // Set up the input device and stream with the default input config.
-    let input_device = if opt.input_device == "default" {
-        audio_host.default_input_device()
-    } else {
-        audio_host
-            .input_devices()?
-            .find(|x| x.name().map(|y| y == opt.input_device).unwrap_or(false))
-    }
-    .expect("Failed to find input input_device!");
-    println!("Input device: {}", input_device.name()?);
-    Ok(input_device)
-}
-
-fn get_output_device(audio_host: &Host, opt: &Opt) -> Result<Device, Box<dyn Error>> {
-    // Set up the output input_device and stream with the default output config.
-    let output_device = if opt.output_device == "default" {
-        audio_host.default_output_device()
-    } else {
-        for dev in audio_host.output_devices()? {
-            println!("{}", dev.name()?);
-        }
-        audio_host
-            .output_devices()?
-            .find(|x| x.name().map(|y| y == opt.output_device).unwrap_or(false))
-    }
-    .expect("Failed to find output device!");
-    println!("Output device: {}", output_device.name()?);
-    Ok(output_device)
-}
-
-fn get_device_config(device: &Device) -> StreamConfig {
-    // get the device config
-    // HINT: does the same for input and output devices!
-    let mut supported_configs_range = device
-        .supported_input_configs()
-        .expect("Error while querying configs!");
-    let supported_config = if let Some(cfg) = supported_configs_range
-        .next()
-        .expect("No supported config!")
-        .try_with_sample_rate(cpal::SampleRate(22050))
-    {
-        cfg
-    } else {
-        eprintln!("Failed to use 22.05 kHz SR!");
-        supported_configs_range
-            .next()
-            .expect("No supported config!")
-            .with_max_sample_rate()
-    };
-    let config: StreamConfig = supported_config.into();
-    config
 }

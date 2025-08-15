@@ -5,8 +5,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use voice_chat::Client;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = args().collect();
 
     if args.len() <= 1 {
@@ -32,7 +31,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let port: String = args.get(2).unwrap_or(&String::from("8888")).to_string();
             let mut client = Client::new(format!("{ip}:{port}"))?;
             println!("Listening to {}...", client.address);
-            client.listen().await?;
+            smol::block_on(async { client.listen().await })?;
         }
         "-c" | "--client" => {
             println!("Starting client...");
@@ -42,10 +41,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .to_string();
             let mut client = Client::new(address)?;
             println!("Trying to connect to {}...", client.address);
-            client.connect().await?;
+            smol::block_on(async { client.connect().await })?;
         }
         _ => {
-            println!("Invalid argument '{}'", args[1]);
+            eprintln!("Invalid argument '{}'", args[1]);
         }
     }
 

@@ -6,8 +6,26 @@ use std::error::Error;
 // Helper functions
 
 pub fn normalize(vector: &[f32]) -> Vec<f32> {
-    let sum: f32 = vector.iter().sum();
-    vector.iter().map(|e| *e / sum).collect()
+    // filter out noise
+    let vector: Vec<f32> = vector
+        .iter()
+        .map(|f| if f.abs() < 1e-4f32 { &0.0f32 } else { f })
+        .copied()
+        .collect();
+    let mut min: f32 = 100.0;
+    let mut max: f32 = -100.0;
+    for i in &vector {
+        let f = *i;
+        if f < min {
+            min = f;
+        }
+        if f > max {
+            max = f;
+        }
+    }
+
+    let norm = |f: &f32| 2.0 * ((f - min) / (max - min)) - 1.0; // [-1.0, 1.0]
+    vector.iter().map(norm).collect()
 }
 
 pub fn buffer_to_audio_data(buffer: &[u8]) -> Vec<f32> {
@@ -89,11 +107,32 @@ pub fn get_output_device(audio_host: &Host, opt: &Opt) -> Result<Device, Box<dyn
     Ok(output_device)
 }
 
-pub fn get_device_config(device: &Device) -> StreamConfig {
-    // get the device config
-    // HINT: does the same for input and output devices!
+pub fn get_input_config(device: &Device) -> StreamConfig {
+    // get the input config
     let mut supported_configs_range = device
         .supported_input_configs()
+        .expect("Error while querying configs!");
+    let supported_config = if let Some(cfg) = supported_configs_range
+        .next()
+        .expect("No supported config!")
+        .try_with_sample_rate(cpal::SampleRate(22050))
+    {
+        cfg
+    } else {
+        eprintln!("Failed to use 22.05 kHz SR!");
+        supported_configs_range
+            .next()
+            .expect("No supported config!")
+            .with_max_sample_rate()
+    };
+    let config: StreamConfig = supported_config.into();
+    config
+}
+
+pub fn get_output_config(device: &Device) -> StreamConfig {
+    // get the input config
+    let mut supported_configs_range = device
+        .supported_output_configs()
         .expect("Error while querying configs!");
     let supported_config = if let Some(cfg) = supported_configs_range
         .next()

@@ -3,6 +3,8 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host, StreamConfig};
 use std::error::Error;
 
+const NOISE_THRESHOLD: f32 = 0.20;
+
 /// Normalizes the audio data and filters out most noise.
 pub fn normalize(vector: &[f32]) -> Vec<f32> {
     // filter out (most) noise
@@ -12,7 +14,9 @@ pub fn normalize(vector: &[f32]) -> Vec<f32> {
         .copied()
         .collect();
 
-    if vector.iter().all(|f| *f == 0.0f32) {
+    if vector.iter().filter(|f| **f == 0.0f32).count()
+        > (vector.len() as f32 * NOISE_THRESHOLD) as usize
+    {
         vector = Vec::new();
     }
 

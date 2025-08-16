@@ -157,7 +157,7 @@ impl Client {
         let stream = TcpStream::connect(&self.address)?;
         if stream.peer_addr()?.ip() == stream.local_addr()?.ip() {
             eprintln!(
-                "\nWARNING: It seems like you are connecting to yourself. Unless you specefied different output devices for the the chat instances, you may hear a lot of noise and echoes.\n"
+                "\nWARNING: It seems like you are connecting to yourself. Unless you specified different output devices for the the chat instances, you may hear a lot of noise and echoes.\n"
             );
         }
         self.chat(stream).await?;
